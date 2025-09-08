@@ -1,0 +1,224 @@
+# Teams Integration Deployment Configuration
+# Docker Compose setup for Supply Chain Forecasting with Microsoft Teams
+
+version: '3.8'
+
+services:
+  # MongoDB for persistent data storage
+  mongodb:
+    image: mongo:7.0
+    container_name: supply-chain-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-supplychain2025}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-supply_chain_forecasting}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - supply_chain_network
+
+  # Redis for caching and real-time data
+  redis:
+    image: redis:7.2-alpine
+    container_name: supply-chain-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-supplychain2025}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - supply_chain_network
+
+  # Apache Kafka for streaming
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: supply-chain-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper
+    networks:
+      - supply_chain_network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: supply-chain-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - supply_chain_network
+
+  # Supply Chain Forecasting API
+  supply-chain-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.supply-chain-api
+    container_name: supply-chain-api
+    restart: unless-stopped
+    depends_on:
+      - mongodb
+      - redis
+    ports:
+      - "8000:8000"
+    environment:
+      MONGODB_URL: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-supplychain2025}@mongodb:27017/${MONGO_DATABASE:-supply_chain_forecasting}?authSource=admin
+      REDIS_URL: redis://:${REDIS_PASSWORD:-supplychain2025}@redis:6379/0
+      TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL}
+      API_SECRET_KEY: ${API_SECRET_KEY:-supply-chain-secret-key-2025}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - supply_chain_network
+
+  # Teams Integration Pipeline
+  teams-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.teams-pipeline
+    container_name: teams-pipeline
+    restart: unless-stopped
+    depends_on:
+      - kafka
+      - mongodb
+      - redis
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MONGODB_URL: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-supplychain2025}@mongodb:27017/${MONGO_DATABASE:-supply_chain_forecasting}?authSource=admin
+      REDIS_URL: redis://:${REDIS_PASSWORD:-supplychain2025}@redis:6379/0
+      TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - supply_chain_network
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:v2.40.0
+    container_name: supply-chain-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - supply_chain_network
+
+  # Grafana for dashboards
+  grafana:
+    image: grafana/grafana:9.3.0
+    container_name: supply-chain-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-supplychain2025}
+      GF_USERS_ALLOW_SIGN_UP: false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - supply_chain_network
+
+  # NGINX for load balancing and SSL termination
+  nginx:
+    image: nginx:1.24-alpine
+    container_name: supply-chain-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/html:/usr/share/nginx/html
+    depends_on:
+      - supply-chain-api
+      - grafana
+    networks:
+      - supply_chain_network
+
+  # Health Check Service
+  health-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.health-monitor
+    container_name: supply-chain-health
+    restart: unless-stopped
+    depends_on:
+      - supply-chain-api
+      - teams-pipeline
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-supplychain2025}@redis:6379/0
+      TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL}
+      CHECK_INTERVAL: ${HEALTH_CHECK_INTERVAL:-300}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - supply_chain_network
+
+  # Data Migration Service (run once)
+  data-migration:
+    build:
+      context: .
+      dockerfile: Dockerfile.data-migration
+    container_name: supply-chain-migration
+    depends_on:
+      - mongodb
+    environment:
+      MONGODB_URL: mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-supplychain2025}@mongodb:27017/${MONGO_DATABASE:-supply_chain_forecasting}?authSource=admin
+      SOURCE_DATA_PATH: /app/data/migration
+    volumes:
+      - ./data/migration:/app/data/migration
+      - ./logs:/app/logs
+    networks:
+      - supply_chain_network
+    profiles:
+      - migration
+
+volumes:
+  mongodb_data:
+    driver: local
+  redis_data:
+    driver: local
+  zookeeper_data:
+    driver: local
+  kafka_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  supply_chain_network:
+    driver: bridge
